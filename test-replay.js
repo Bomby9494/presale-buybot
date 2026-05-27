@@ -83,7 +83,6 @@ function progressBar(c, t, l = 16) {
     `👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${contributor}">${shortAddr(contributor)}</a>`,
     `💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethAmount.toFixed(4)} ETH)`,
     `🌐 <b>Network:</b> Ethereum`,
-    `📦 <b>Tokens Received:</b> ${formatTokens(tokensReceived)} ${TOKEN_SYMBOL}`,
     '━━━━━━━━━━━━━━━━━━',
     `📈 <b>Total Raised:</b>   ${formatUsd(totalRaisedUsd)}`,
     '',
@@ -91,10 +90,19 @@ function progressBar(c, t, l = 16) {
   ];
 
   const text = lines.join('\n');
-  const buttons = [[
-    { text: '🔍 View TX', url: `https://etherscan.io/tx/${log.transactionHash}` },
-    { text: '🚀 PinkSale', url: `https://www.pinksale.finance/launchpad/ethereum/${PRESALE}` },
-  ]];
+  const buttons = [
+    [
+      { text: '🔍 View TX', url: `https://etherscan.io/tx/${log.transactionHash}` },
+      { text: '🚀 PinkSale', url: `https://www.pinksale.finance/launchpad/ethereum/${PRESALE}` },
+    ],
+    [
+      { text: '🤖 Android APP', url: 'https://play.google.com/store/apps/details?id=com.kirogames.bugsdestroyerinsectsmash' },
+      { text: '🍎 iOS APP', url: 'https://apps.apple.com/in/app/bugs-destroyer-insect-smash/id1518031439' },
+    ],
+    [
+      { text: '🌐 Website', url: 'https://bdsbc.net/' },
+    ],
+  ];
 
   console.log('\n--- Message preview ---');
   console.log(text.replace(/<[^>]+>/g, ''));

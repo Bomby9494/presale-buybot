@@ -171,9 +171,6 @@ function buildMessage(contributor, ethAmount, txHash) {
   lines.push(`👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${contributor}">${shortAddr(contributor)}</a>`);
   lines.push(`💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethAmount.toFixed(4)} ETH)`);
   lines.push(`🌐 <b>Network:</b> Ethereum`);
-  if (tokensReceived !== null) {
-    lines.push(`📦 <b>Tokens Received:</b> ${formatTokens(tokensReceived)} ${TOKEN_SYMBOL}`);
-  }
   lines.push('━━━━━━━━━━━━━━━━━━');
   lines.push(`📈 <b>Total Raised:</b>   ${formatUsd(totalRaisedUsd)}`);
 
@@ -187,6 +184,13 @@ function buildMessage(contributor, ethAmount, txHash) {
     [
       { text: '🔍 View TX', url: `https://etherscan.io/tx/${txHash}` },
       { text: '🚀 PinkSale', url: `https://www.pinksale.finance/launchpad/ethereum/${PRESALE_CONTRACT}` },
+    ],
+    [
+      { text: '🤖 Android APP', url: 'https://play.google.com/store/apps/details?id=com.kirogames.bugsdestroyerinsectsmash' },
+      { text: '🍎 iOS APP', url: 'https://apps.apple.com/in/app/bugs-destroyer-insect-smash/id1518031439' },
+    ],
+    [
+      { text: '🌐 Website', url: 'https://bdsbc.net/' },
     ],
   ];
 

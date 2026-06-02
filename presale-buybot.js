@@ -9,6 +9,7 @@ const IMAGE_PATH = path.join(__dirname, 'buybotBDG.jpg');
 const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
+  TELEGRAM_CHAT_IDS,
   PRESALE_CONTRACT,
   TOKEN_SYMBOL = 'BDSBC',
   TOKEN_DECIMALS = '18',
@@ -19,8 +20,15 @@ const {
   POLL_INTERVAL_MS = '12000',
 } = process.env;
 
-if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID || !PRESALE_CONTRACT) {
-  console.error('[presale-bot] Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, or PRESALE_CONTRACT in .env');
+// Accept either a single TELEGRAM_CHAT_ID or a comma-separated TELEGRAM_CHAT_IDS.
+// Each target may be "chatId" or "chatId_threadId" to post into a forum topic.
+const chatTargets = (TELEGRAM_CHAT_IDS || TELEGRAM_CHAT_ID || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+if (!TELEGRAM_BOT_TOKEN || chatTargets.length === 0 || !PRESALE_CONTRACT) {
+  console.error('[presale-bot] Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID(S), or PRESALE_CONTRACT in .env');
   process.exit(1);
 }
 
@@ -79,9 +87,10 @@ async function fetchTotalRaised() {
 
 // ── Telegram ──
 
-async function sendTelegram(text, buttons) {
-  const chatId = TELEGRAM_CHAT_ID.includes('_') ? TELEGRAM_CHAT_ID.split('_')[0] : TELEGRAM_CHAT_ID;
-  const threadId = TELEGRAM_CHAT_ID.includes('_') ? TELEGRAM_CHAT_ID.split('_')[1] : null;
+// Send one alert to a single target ("chatId" or "chatId_threadId").
+async function sendToTarget(target, text, buttons) {
+  const chatId = target.includes('_') ? target.split('_')[0] : target;
+  const threadId = target.includes('_') ? target.split('_')[1] : null;
 
   const hasImage = fs.existsSync(IMAGE_PATH);
 
@@ -98,9 +107,9 @@ async function sendTelegram(text, buttons) {
       const res = await fetch(`${TELEGRAM_API}/sendPhoto`, { method: 'POST', body: form });
       const data = await res.json();
       if (data.ok) return;
-      console.warn('[presale-bot] sendPhoto failed, falling back to text:', data.description);
+      console.warn(`[presale-bot] sendPhoto failed for ${target}, falling back to text:`, data.description);
     } catch (e) {
-      console.warn('[presale-bot] sendPhoto error, falling back to text:', e.message);
+      console.warn(`[presale-bot] sendPhoto error for ${target}, falling back to text:`, e.message);
     }
   }
 
@@ -120,9 +129,16 @@ async function sendTelegram(text, buttons) {
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (!data.ok) console.error('[presale-bot] Telegram error:', data.description);
+    if (!data.ok) console.error(`[presale-bot] Telegram error for ${target}:`, data.description);
   } catch (e) {
-    console.error('[presale-bot] Telegram send failed:', e.message);
+    console.error(`[presale-bot] Telegram send failed for ${target}:`, e.message);
+  }
+}
+
+// Fan out the same alert to every configured target.
+async function sendTelegram(text, buttons) {
+  for (const target of chatTargets) {
+    await sendToTarget(target, text, buttons);
   }
 }
 
@@ -263,6 +279,7 @@ async function main() {
   console.log(`[presale-bot] Contract: ${PRESALE_CONTRACT}`);
   console.log(`[presale-bot] Token: ${TOKEN_SYMBOL}`);
   console.log(`[presale-bot] Poll interval: ${POLL_MS}ms`);
+  console.log(`[presale-bot] Posting to ${chatTargets.length} chat target(s): ${chatTargets.join(', ')}`);
 
   provider = await createProvider();
   await fetchEthPrice();

@@ -47,15 +47,33 @@ let totalRaisedWei = 0n;
 
 // ── RPC ──
 
+// Ethereum mainnet, pinned. Passing a static network stops ethers v6 from
+// running its background "detect network" routine, which on a flaky endpoint
+// loops "failed to detect network ... retry in 1s" forever and floods the logs
+// (~1GB/day) without ever recovering. With a static network the provider never
+// auto-detects, so a bad endpoint fails fast and we rotate to the next one.
+const ETH_MAINNET = ethers.Network.from(1);
+
+// Primary + fallback from env, then a few reliable public endpoints. Deduped.
+const RPC_ENDPOINTS = [...new Set([
+  RPC_URL,
+  RPC_FALLBACK,
+  'https://eth.llamarpc.com',
+  'https://eth.drpc.org',
+  'https://cloudflare-eth.com',
+].filter(Boolean))];
+
 async function createProvider() {
-  for (const url of [RPC_URL, RPC_FALLBACK]) {
+  for (const url of RPC_ENDPOINTS) {
+    let p;
     try {
-      const p = new ethers.JsonRpcProvider(url);
+      p = new ethers.JsonRpcProvider(url, ETH_MAINNET, { staticNetwork: ETH_MAINNET });
       await p.getBlockNumber();
       console.log(`[presale-bot] Connected to ${url}`);
       return p;
     } catch (e) {
       console.warn(`[presale-bot] RPC failed: ${url} — ${e.message}`);
+      try { p?.destroy?.(); } catch {}
     }
   }
   throw new Error('All RPC endpoints failed');
@@ -259,13 +277,21 @@ async function processLogs(fromBlock, toBlock) {
 async function poll() {
   try {
     const currentBlock = await provider.getBlockNumber();
-    if (currentBlock > lastBlock) {
+    // Lag one block: load-balanced RPCs sometimes report a head their getLogs
+    // node hasn't reached yet, which throws -32602 "block range extends beyond
+    // current head block". One confirmation avoids that race (~12s on ETH).
+    const safeHead = currentBlock - 1;
+    if (safeHead > lastBlock) {
       const from = lastBlock + 1;
-      await processLogs(from, currentBlock);
-      lastBlock = currentBlock;
+      await processLogs(from, safeHead);
+      lastBlock = safeHead;
     }
   } catch (e) {
     console.error(`[presale-bot] Poll error: ${e.message}`);
+    // Tear down the wedged provider before reconnecting, otherwise its
+    // background reconnection keeps looping and leaks a zombie provider per
+    // failed poll (the original log-flood cause).
+    try { provider?.destroy?.(); } catch {}
     try {
       provider = await createProvider();
     } catch (reconnectErr) {

@@ -1,17 +1,24 @@
 #!/usr/bin/env node
-// One-off: replay the most recent Contribute event to ALL configured groups,
-// using the same fan-out logic as the live bot (TELEGRAM_CHAT_IDS).
+// One-off: replay the most recent BUY swap on the Uniswap v4 pool, using the
+// same decode + format logic as the live bot. Prints a preview by default;
+// pass --send to actually fan it out to all TELEGRAM_CHAT_IDS.
 require('dotenv').config();
 const { ethers } = require('ethers');
 const fs = require('fs');
 const path = require('path');
 
-const PRESALE = process.env.PRESALE_CONTRACT;
-const TOPIC = '0x76b049c6a58fbcb3b1b5c347116d3f7bb8ee99c66d0a424ef58b5539acde2e25';
-const tokenPricePerEth = parseFloat(process.env.TOKEN_PRICE_PER_ETH);
-const hardCapEth = parseFloat(process.env.HARD_CAP_ETH);
+const POOL_MANAGER = process.env.POOL_MANAGER || '0x000000000004444c5dc75cB358380D2e3dE08A90';
+const POOL_ID = process.env.POOL_ID;
+const TOKEN_ADDRESS = process.env.TOKEN_ADDRESS || '0x10b2b342111cf1f45f5C0Ab2f3C1055549FE0A22';
+const TOKEN_SYMBOL = process.env.TOKEN_SYMBOL || 'BDSBC';
+const tokenDecimals = parseInt(process.env.TOKEN_DECIMALS || '18', 10);
+const ethDecimals = parseInt(process.env.ETH_DECIMALS || '18', 10);
+const tokenIndex = parseInt(process.env.TOKEN_CURRENCY_INDEX || '1', 10);
+const totalSupply = parseFloat(process.env.TOKEN_TOTAL_SUPPLY || '1000000000');
+const SWAP_TOPIC = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';
 const TELEGRAM_API = `https://api.telegram.org/bot${process.env.TELEGRAM_BOT_TOKEN}`;
 const IMAGE_PATH = path.join(__dirname, 'buybotBDG.jpg');
+const SEND = process.argv.includes('--send');
 
 const chatTargets = (process.env.TELEGRAM_CHAT_IDS || process.env.TELEGRAM_CHAT_ID || '')
   .split(',').map(s => s.trim()).filter(Boolean);
@@ -23,12 +30,13 @@ function formatUsd(v) {
   if (v >= 1) return `$${v.toFixed(2)}`;
   return `$${v.toFixed(4)}`;
 }
-function progressBar(c, t, l = 16) {
-  if (!t) return '';
-  const p = Math.min(c / t, 1);
-  const f = Math.round(p * l);
-  return '█'.repeat(f) + '░'.repeat(l - f) + ` ${(p * 100).toFixed(1)}%`;
+function formatPrice(v) { if (!v || v <= 0) return '$0'; return v >= 1 ? `$${v.toFixed(4)}` : `$${v.toPrecision(4)}`; }
+function formatTokens(a) {
+  if (a >= 1e6) return `${(a / 1e6).toFixed(2)}M`;
+  if (a >= 1000) return `${Math.round(a).toLocaleString('en-US')}`;
+  return a.toFixed(2);
 }
+function toSigned(word) { let v = BigInt('0x' + word); if (v >= (1n << 255n)) v -= (1n << 256n); return v; }
 
 async function sendToTarget(target, text, buttons) {
   const chatId = target.includes('_') ? target.split('_')[0] : target;
@@ -51,46 +59,68 @@ async function sendToTarget(target, text, buttons) {
 }
 
 (async () => {
-  console.log(`Targets: ${chatTargets.join(', ')}`);
-  const provider = new ethers.JsonRpcProvider('https://ethereum-rpc.publicnode.com');
-  const currentBlock = await provider.getBlockNumber();
+  console.log(`Targets: ${chatTargets.join(', ')} | mode: ${SEND ? 'SEND' : 'preview only'}`);
+  const provider = new ethers.JsonRpcProvider('https://ethereum-rpc.publicnode.com', ethers.Network.from(1), { staticNetwork: ethers.Network.from(1) });
+  const head = await provider.getBlockNumber();
   const logs = await provider.getLogs({
-    address: PRESALE, topics: [TOPIC],
-    fromBlock: currentBlock - 10000, toBlock: 'latest',
+    address: POOL_MANAGER, topics: [SWAP_TOPIC, POOL_ID.toLowerCase()],
+    fromBlock: head - 50000, toBlock: head - 1,
   });
-  if (!logs.length) { console.log('No contributions found in recent blocks'); return; }
+  if (!logs.length) { console.log('No swaps found in recent blocks'); return; }
 
-  const log = logs[logs.length - 1];
-  const contributor = ethers.getAddress('0x' + log.topics[1].slice(26));
-  const dataHex = log.data.slice(2);
-  const words = [];
-  for (let i = 0; i < dataHex.length; i += 64) words.push(BigInt('0x' + dataHex.slice(i, i + 64)));
-  const ethAmount = parseFloat(ethers.formatEther(words[1] || 0n));
+  // newest buy (token delta > 0)
+  let chosen = null;
+  for (let i = logs.length - 1; i >= 0; i--) {
+    const d = logs[i].data.slice(2);
+    const w = []; for (let j = 0; j < d.length; j += 64) w.push(d.slice(j, j + 64));
+    const tokenDelta = tokenIndex === 0 ? toSigned(w[0]) : toSigned(w[1]);
+    if (tokenDelta > 0n) { chosen = logs[i]; break; }
+  }
+  if (!chosen) { console.log('No BUY swaps found (only sells)'); return; }
 
-  const [priceRes, balance] = await Promise.all([
-    fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd').then(r => r.json()),
-    provider.getBalance(PRESALE),
-  ]);
+  const d = chosen.data.slice(2);
+  const w = []; for (let j = 0; j < d.length; j += 64) w.push(d.slice(j, j + 64));
+  const amount0 = toSigned(w[0]), amount1 = toSigned(w[1]), sqrtPriceX96 = BigInt('0x' + w[2]);
+  const tokenDelta = tokenIndex === 0 ? amount0 : amount1;
+  const ethDelta = tokenIndex === 0 ? amount1 : amount0;
+  const tokensBought = parseFloat(ethers.formatUnits(tokenDelta, tokenDecimals));
+  const ethSpent = parseFloat(ethers.formatUnits(ethDelta < 0n ? -ethDelta : ethDelta, ethDecimals));
+
+  const sq = Number(sqrtPriceX96) / 2 ** 96;
+  const price1per0 = sq * sq;
+  let ethPerToken;
+  if (tokenIndex === 1) { const tpe = price1per0 * 10 ** (ethDecimals - tokenDecimals); ethPerToken = tpe > 0 ? 1 / tpe : 0; }
+  else { ethPerToken = price1per0 * 10 ** (tokenDecimals - ethDecimals); }
+
+  const priceRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd').then(r => r.json());
   const ethPrice = priceRes.ethereum.usd;
-  const totalRaisedUsd = parseFloat(ethers.formatEther(balance)) * ethPrice;
-  const usdSpent = ethAmount * ethPrice;
-  const hardCapUsd = hardCapEth * ethPrice;
+  const priceUsd = ethPerToken * ethPrice;
+  const usdSpent = ethSpent * ethPrice;
+  const marketCapUsd = priceUsd * totalSupply;
+
+  let buyer = ethers.getAddress('0x' + chosen.topics[2].slice(26));
+  try { const tx = await provider.getTransaction(chosen.transactionHash); if (tx?.from) buyer = tx.from; } catch {}
+
+  console.log(`\nDecoded: spent ${ethSpent} ETH (${formatUsd(usdSpent)}), got ${formatTokens(tokensBought)} ${TOKEN_SYMBOL}`);
+  console.log(`Price: ${formatPrice(priceUsd)} | MCap: ${formatUsd(marketCapUsd)} | buyer ${buyer}`);
 
   const lines = [
-    `<b>🚀 New Presale Buy! 🚀</b>`, '',
-    `👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${contributor}">${shortAddr(contributor)}</a>`,
-    `💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethAmount.toFixed(4)} ETH)`,
-    `🌐 <b>Network:</b> Ethereum`,
+    `<b>🚀 New ${TOKEN_SYMBOL} Buy! 🚀</b>`, '',
+    `👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${buyer}">${shortAddr(buyer)}</a>`,
+    `💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethSpent.toFixed(4)} ETH)`,
+    `🪙 <b>Got:</b>     ${formatTokens(tokensBought)} ${TOKEN_SYMBOL}`,
     '━━━━━━━━━━━━━━━━━━',
-    `📈 <b>Total Raised:</b>   ${formatUsd(totalRaisedUsd)}`, '',
-    `<code>${progressBar(totalRaisedUsd, hardCapUsd)}</code>`,
+    `💲 <b>Price:</b>   ${formatPrice(priceUsd)}`,
+    `📊 <b>MCap:</b>    ${formatUsd(marketCapUsd)}`,
+    `🌐 <b>Network:</b> Ethereum`,
   ];
   const text = lines.join('\n');
   const buttons = [
     [
-      { text: '🔍 View TX', url: `https://etherscan.io/tx/${log.transactionHash}` },
-      { text: '🚀 PinkSale', url: `https://www.pinksale.finance/launchpad/ethereum/${PRESALE}` },
+      { text: '🔍 View TX', url: `https://etherscan.io/tx/${chosen.transactionHash}` },
+      { text: '📈 Chart', url: `https://dexscreener.com/ethereum/${POOL_ID}` },
     ],
+    [{ text: '🛒 Buy', url: `https://app.uniswap.org/swap?chain=ethereum&outputCurrency=${TOKEN_ADDRESS}` }],
     [
       { text: '🤖 Android APP', url: 'https://play.google.com/store/apps/details?id=com.kirogames.bugsdestroyerinsectsmash' },
       { text: '🍎 iOS APP', url: 'https://apps.apple.com/in/app/bugs-destroyer-insect-smash/id1518031439' },
@@ -102,5 +132,6 @@ async function sendToTarget(target, text, buttons) {
   console.log(text.replace(/<[^>]+>/g, ''));
   console.log('--- end preview ---\n');
 
+  if (!SEND) { console.log('(preview only; pass --send to post to Telegram)'); return; }
   for (const target of chatTargets) await sendToTarget(target, text, buttons);
 })();

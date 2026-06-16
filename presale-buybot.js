@@ -10,11 +10,15 @@ const {
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   TELEGRAM_CHAT_IDS,
-  PRESALE_CONTRACT,
+  POOL_MANAGER = '0x000000000004444c5dc75cB358380D2e3dE08A90', // Uniswap v4 PoolManager (mainnet)
+  POOL_ID,
+  TOKEN_ADDRESS = '0x10b2b342111cf1f45f5C0Ab2f3C1055549FE0A22',
   TOKEN_SYMBOL = 'BDSBC',
   TOKEN_DECIMALS = '18',
-  TOKEN_PRICE_PER_ETH,
-  HARD_CAP_ETH,
+  ETH_DECIMALS = '18',
+  TOKEN_CURRENCY_INDEX = '1',     // which currency in the pool is the token (0 or 1); ETH is the other
+  TOKEN_TOTAL_SUPPLY = '1000000000',
+  MIN_BUY_USD = '0',              // post every buy by default
   RPC_URL = 'https://ethereum-rpc.publicnode.com',
   RPC_FALLBACK = 'https://rpc.ankr.com/eth',
   POLL_INTERVAL_MS = '12000',
@@ -27,23 +31,31 @@ const chatTargets = (TELEGRAM_CHAT_IDS || TELEGRAM_CHAT_ID || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-if (!TELEGRAM_BOT_TOKEN || chatTargets.length === 0 || !PRESALE_CONTRACT) {
-  console.error('[presale-bot] Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID(S), or PRESALE_CONTRACT in .env');
+if (!TELEGRAM_BOT_TOKEN || chatTargets.length === 0 || !POOL_ID) {
+  console.error('[buybot] Missing TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID(S), or POOL_ID in .env');
   process.exit(1);
 }
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}`;
-const CONTRIBUTED_TOPIC = '0x76b049c6a58fbcb3b1b5c347116d3f7bb8ee99c66d0a424ef58b5539acde2e25';
+
+// Uniswap v4 PoolManager: Swap(bytes32 indexed id, address indexed sender,
+//   int128 amount0, int128 amount1, uint160 sqrtPriceX96, uint128 liquidity,
+//   int24 tick, uint24 fee). All swaps for every pool come from the one
+//   singleton, so we filter by topic0 (Swap) + topic1 (our poolId).
+const SWAP_TOPIC = '0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f';
+const poolIdTopic = POOL_ID.toLowerCase();
+
 const POLL_MS = parseInt(POLL_INTERVAL_MS, 10);
-const decimals = parseInt(TOKEN_DECIMALS, 10);
-const tokenPricePerEth = TOKEN_PRICE_PER_ETH ? parseFloat(TOKEN_PRICE_PER_ETH) : null;
-const hardCapEth = HARD_CAP_ETH ? parseFloat(HARD_CAP_ETH) : null;
+const tokenDecimals = parseInt(TOKEN_DECIMALS, 10);
+const ethDecimals = parseInt(ETH_DECIMALS, 10);
+const tokenIndex = parseInt(TOKEN_CURRENCY_INDEX, 10); // 0 or 1
+const totalSupply = parseFloat(TOKEN_TOTAL_SUPPLY);
+const minBuyUsd = parseFloat(MIN_BUY_USD) || 0;
 
 let provider = null;
 let lastBlock = 0;
 const processedTxs = new Set();
 let ethPriceUsd = 0;
-let totalRaisedWei = 0n;
 
 // ── RPC ──
 
@@ -69,10 +81,10 @@ async function createProvider() {
     try {
       p = new ethers.JsonRpcProvider(url, ETH_MAINNET, { staticNetwork: ETH_MAINNET });
       await p.getBlockNumber();
-      console.log(`[presale-bot] Connected to ${url}`);
+      console.log(`[buybot] Connected to ${url}`);
       return p;
     } catch (e) {
-      console.warn(`[presale-bot] RPC failed: ${url} — ${e.message}`);
+      console.warn(`[buybot] RPC failed: ${url} — ${e.message}`);
       try { p?.destroy?.(); } catch {}
     }
   }
@@ -86,20 +98,9 @@ async function fetchEthPrice() {
     const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd');
     const data = await res.json();
     ethPriceUsd = data.ethereum?.usd || ethPriceUsd;
-    console.log(`[presale-bot] ETH price: $${ethPriceUsd}`);
+    console.log(`[buybot] ETH price: $${ethPriceUsd}`);
   } catch (e) {
-    console.warn(`[presale-bot] ETH price fetch failed: ${e.message}`);
-  }
-}
-
-// ── Contract balance (total raised) ──
-
-async function fetchTotalRaised() {
-  try {
-    const balance = await provider.getBalance(PRESALE_CONTRACT);
-    totalRaisedWei = balance;
-  } catch (e) {
-    console.warn(`[presale-bot] Balance fetch failed: ${e.message}`);
+    console.warn(`[buybot] ETH price fetch failed: ${e.message}`);
   }
 }
 
@@ -125,9 +126,9 @@ async function sendToTarget(target, text, buttons) {
       const res = await fetch(`${TELEGRAM_API}/sendPhoto`, { method: 'POST', body: form });
       const data = await res.json();
       if (data.ok) return;
-      console.warn(`[presale-bot] sendPhoto failed for ${target}, falling back to text:`, data.description);
+      console.warn(`[buybot] sendPhoto failed for ${target}, falling back to text:`, data.description);
     } catch (e) {
-      console.warn(`[presale-bot] sendPhoto error for ${target}, falling back to text:`, e.message);
+      console.warn(`[buybot] sendPhoto error for ${target}, falling back to text:`, e.message);
     }
   }
 
@@ -147,9 +148,9 @@ async function sendToTarget(target, text, buttons) {
       body: JSON.stringify(body),
     });
     const data = await res.json();
-    if (!data.ok) console.error(`[presale-bot] Telegram error for ${target}:`, data.description);
+    if (!data.ok) console.error(`[buybot] Telegram error for ${target}:`, data.description);
   } catch (e) {
-    console.error(`[presale-bot] Telegram send failed for ${target}:`, e.message);
+    console.error(`[buybot] Telegram send failed for ${target}:`, e.message);
   }
 }
 
@@ -173,51 +174,51 @@ function formatUsd(value) {
   return `$${value.toFixed(4)}`;
 }
 
+// Sub-cent token prices need significant figures, not fixed decimals.
+function formatPrice(value) {
+  if (!value || value <= 0) return '$0';
+  if (value >= 1) return `$${value.toFixed(4)}`;
+  return `$${value.toPrecision(4)}`;
+}
+
 function formatTokens(amount) {
   if (amount >= 1_000_000) return `${(amount / 1_000_000).toFixed(2)}M`;
   if (amount >= 1_000) return `${Math.round(amount).toLocaleString('en-US')}`;
   return amount.toFixed(2);
 }
 
-function progressBar(current, total, len = 16) {
-  if (!total) return '';
-  const pct = Math.min(current / total, 1);
-  const filled = Math.round(pct * len);
-  const empty = len - filled;
-  return `${'█'.repeat(filled)}${'░'.repeat(empty)} ${(pct * 100).toFixed(1)}%`;
-}
-
-function buyerEmoji() {
-  return '🚀 New Presale Buy! 🚀';
+// int128 values are ABI sign-extended across the full 256-bit word, so read
+// each data word as a 256-bit two's-complement integer.
+function toSigned(word) {
+  let v = BigInt('0x' + word);
+  if (v >= (1n << 255n)) v -= (1n << 256n);
+  return v;
 }
 
 // ── Build alert message ──
 
-function buildMessage(contributor, ethAmount, txHash) {
-  const usdSpent = ethAmount * ethPriceUsd;
-  const tokensReceived = tokenPricePerEth ? ethAmount * tokenPricePerEth : null;
-  const totalRaisedEth = parseFloat(ethers.formatEther(totalRaisedWei));
-  const totalRaisedUsd = totalRaisedEth * ethPriceUsd;
+function buildMessage({ buyer, ethSpent, tokensBought, priceUsd, txHash }) {
+  const usdSpent = ethSpent * ethPriceUsd;
+  const marketCapUsd = priceUsd * totalSupply;
 
   const lines = [];
-  lines.push(`<b>${buyerEmoji()}</b>`);
+  lines.push(`<b>🚀 New ${TOKEN_SYMBOL} Buy! 🚀</b>`);
   lines.push('');
-  lines.push(`👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${contributor}">${shortAddr(contributor)}</a>`);
-  lines.push(`💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethAmount.toFixed(4)} ETH)`);
-  lines.push(`🌐 <b>Network:</b> Ethereum`);
+  lines.push(`👤 <b>Buyer:</b>   <a href="https://etherscan.io/address/${buyer}">${shortAddr(buyer)}</a>`);
+  lines.push(`💵 <b>Spent:</b>   ${formatUsd(usdSpent)} (${ethSpent.toFixed(4)} ETH)`);
+  lines.push(`🪙 <b>Got:</b>     ${formatTokens(tokensBought)} ${TOKEN_SYMBOL}`);
   lines.push('━━━━━━━━━━━━━━━━━━');
-  lines.push(`📈 <b>Total Raised:</b>   ${formatUsd(totalRaisedUsd)}`);
-
-  if (hardCapEth) {
-    const hardCapUsd = hardCapEth * ethPriceUsd;
-    lines.push('');
-    lines.push(`<code>${progressBar(totalRaisedUsd, hardCapUsd)}</code>`);
-  }
+  if (priceUsd > 0) lines.push(`💲 <b>Price:</b>   ${formatPrice(priceUsd)}`);
+  if (marketCapUsd > 0) lines.push(`📊 <b>MCap:</b>    ${formatUsd(marketCapUsd)}`);
+  lines.push(`🌐 <b>Network:</b> Ethereum`);
 
   const buttons = [
     [
       { text: '🔍 View TX', url: `https://etherscan.io/tx/${txHash}` },
-      { text: '🚀 PinkSale', url: `https://www.pinksale.finance/launchpad/ethereum/${PRESALE_CONTRACT}` },
+      { text: '📈 Chart', url: `https://dexscreener.com/ethereum/${POOL_ID}` },
+    ],
+    [
+      { text: '🛒 Buy', url: `https://app.uniswap.org/swap?chain=ethereum&outputCurrency=${TOKEN_ADDRESS}` },
     ],
     [
       { text: '🤖 Android APP', url: 'https://play.google.com/store/apps/details?id=com.kirogames.bugsdestroyerinsectsmash' },
@@ -231,12 +232,49 @@ function buildMessage(contributor, ethAmount, txHash) {
   return { text: lines.join('\n'), buttons };
 }
 
+// ── Swap decoding ──
+
+// Decode a v4 Swap log into the fields we care about. Returns null if it is not
+// a buy of our token (i.e. the swapper did not receive the token).
+function decodeSwap(log) {
+  const d = log.data.slice(2);
+  const words = [];
+  for (let i = 0; i < d.length; i += 64) words.push(d.slice(i, i + 64));
+  const amount0 = toSigned(words[0]);
+  const amount1 = toSigned(words[1]);
+  const sqrtPriceX96 = BigInt('0x' + words[2]);
+
+  const tokenDelta = tokenIndex === 0 ? amount0 : amount1; // >0 means swapper received the token (BUY)
+  const ethDelta = tokenIndex === 0 ? amount1 : amount0;
+  if (tokenDelta <= 0n) return null; // sell or zero — skip
+
+  const tokensBought = parseFloat(ethers.formatUnits(tokenDelta, tokenDecimals));
+  const ethSpent = parseFloat(ethers.formatUnits(ethDelta < 0n ? -ethDelta : ethDelta, ethDecimals));
+
+  // Spot price from sqrtPriceX96 (post-swap). price1per0 = (sqrt/2^96)^2 is the
+  // raw token1-per-token0 ratio; adjust for the two currencies' decimals.
+  const sq = Number(sqrtPriceX96) / 2 ** 96;
+  const price1per0 = sq * sq; // token1 raw per token0 raw
+  let ethPerToken;
+  if (tokenIndex === 1) {
+    // token = c1, eth = c0. tokens(c1) per eth(c0) = price1per0 * 10^(dec0-dec1)
+    const tokensPerEth = price1per0 * 10 ** (ethDecimals - tokenDecimals);
+    ethPerToken = tokensPerEth > 0 ? 1 / tokensPerEth : 0;
+  } else {
+    // token = c0, eth = c1. eth(c1) per token(c0) = price1per0 * 10^(dec0-dec1)
+    ethPerToken = price1per0 * 10 ** (tokenDecimals - ethDecimals);
+  }
+  const priceUsd = ethPerToken * ethPriceUsd;
+
+  return { tokensBought, ethSpent, priceUsd };
+}
+
 // ── Event processing ──
 
 async function processLogs(fromBlock, toBlock) {
   const logs = await provider.getLogs({
-    address: PRESALE_CONTRACT,
-    topics: [CONTRIBUTED_TOPIC],
+    address: POOL_MANAGER,
+    topics: [SWAP_TOPIC, poolIdTopic],
     fromBlock,
     toBlock,
   });
@@ -246,22 +284,34 @@ async function processLogs(fromBlock, toBlock) {
     if (processedTxs.has(txKey)) continue;
     processedTxs.add(txKey);
 
-    const contributor = ethers.getAddress('0x' + log.topics[1].slice(26));
+    const swap = decodeSwap(log);
+    if (!swap) continue; // not a buy
 
-    const dataHex = log.data.slice(2);
-    const words = [];
-    for (let i = 0; i < dataHex.length; i += 64) {
-      words.push(BigInt('0x' + dataHex.slice(i, i + 64)));
+    const usdSpent = swap.ethSpent * ethPriceUsd;
+    if (minBuyUsd > 0 && usdSpent < minBuyUsd) {
+      console.log(`[buybot] Skipped sub-threshold buy: ${formatUsd(usdSpent)} < ${formatUsd(minBuyUsd)}`);
+      continue;
     }
-    // words[0] = currencyType, words[1] = amount (wei), words[2] = cumulative, words[3] = timestamp
-    const amountWei = words[1] || 0n;
-    const ethAmount = parseFloat(ethers.formatEther(amountWei));
 
-    await fetchTotalRaised();
+    // The event's `sender` is the router contract; the real buyer is the tx
+    // origin. Fall back to the router address if the tx can't be fetched.
+    let buyer = ethers.getAddress('0x' + log.topics[2].slice(26));
+    try {
+      const tx = await provider.getTransaction(log.transactionHash);
+      if (tx?.from) buyer = tx.from;
+    } catch (e) {
+      console.warn(`[buybot] getTransaction failed for ${log.transactionHash}: ${e.message}`);
+    }
 
-    const { text, buttons } = buildMessage(contributor, ethAmount, log.transactionHash);
+    const { text, buttons } = buildMessage({
+      buyer,
+      ethSpent: swap.ethSpent,
+      tokensBought: swap.tokensBought,
+      priceUsd: swap.priceUsd,
+      txHash: log.transactionHash,
+    });
     await sendTelegram(text, buttons);
-    console.log(`[presale-bot] Alert sent: ${shortAddr(contributor)} contributed ${ethAmount} ETH`);
+    console.log(`[buybot] Alert sent: ${shortAddr(buyer)} bought ${formatTokens(swap.tokensBought)} ${TOKEN_SYMBOL} for ${swap.ethSpent} ETH`);
   }
 
   if (processedTxs.size > 5000) {
@@ -287,7 +337,7 @@ async function poll() {
       lastBlock = safeHead;
     }
   } catch (e) {
-    console.error(`[presale-bot] Poll error: ${e.message}`);
+    console.error(`[buybot] Poll error: ${e.message}`);
     // Tear down the wedged provider before reconnecting, otherwise its
     // background reconnection keeps looping and leaks a zombie provider per
     // failed poll (the original log-flood cause).
@@ -295,35 +345,33 @@ async function poll() {
     try {
       provider = await createProvider();
     } catch (reconnectErr) {
-      console.error(`[presale-bot] Reconnect failed: ${reconnectErr.message}`);
+      console.error(`[buybot] Reconnect failed: ${reconnectErr.message}`);
     }
   }
 }
 
 async function main() {
-  console.log('[presale-bot] Starting...');
-  console.log(`[presale-bot] Contract: ${PRESALE_CONTRACT}`);
-  console.log(`[presale-bot] Token: ${TOKEN_SYMBOL}`);
-  console.log(`[presale-bot] Poll interval: ${POLL_MS}ms`);
-  console.log(`[presale-bot] Posting to ${chatTargets.length} chat target(s): ${chatTargets.join(', ')}`);
+  console.log('[buybot] Starting...');
+  console.log(`[buybot] PoolManager: ${POOL_MANAGER}`);
+  console.log(`[buybot] PoolId: ${POOL_ID}`);
+  console.log(`[buybot] Token: ${TOKEN_SYMBOL} (currency${tokenIndex})`);
+  console.log(`[buybot] Min buy: ${minBuyUsd > 0 ? formatUsd(minBuyUsd) : 'none (all buys)'}`);
+  console.log(`[buybot] Poll interval: ${POLL_MS}ms`);
+  console.log(`[buybot] Posting to ${chatTargets.length} chat target(s): ${chatTargets.join(', ')}`);
 
   provider = await createProvider();
   await fetchEthPrice();
-  await fetchTotalRaised();
-
-  const totalEth = parseFloat(ethers.formatEther(totalRaisedWei));
-  console.log(`[presale-bot] Current total raised: ${totalEth.toFixed(4)} ETH (~${formatUsd(totalEth * ethPriceUsd)})`);
 
   lastBlock = await provider.getBlockNumber();
-  console.log(`[presale-bot] Starting from block ${lastBlock}`);
+  console.log(`[buybot] Starting from block ${lastBlock}`);
 
   setInterval(fetchEthPrice, 60_000);
   setInterval(poll, POLL_MS);
 }
 
-process.on('uncaughtException', (e) => console.error('[presale-bot] Uncaught:', e.message));
-process.on('unhandledRejection', (r) => console.error('[presale-bot] Unhandled:', r));
-process.on('SIGINT', () => { console.log('[presale-bot] Shutting down'); process.exit(0); });
-process.on('SIGTERM', () => { console.log('[presale-bot] Shutting down'); process.exit(0); });
+process.on('uncaughtException', (e) => console.error('[buybot] Uncaught:', e.message));
+process.on('unhandledRejection', (r) => console.error('[buybot] Unhandled:', r));
+process.on('SIGINT', () => { console.log('[buybot] Shutting down'); process.exit(0); });
+process.on('SIGTERM', () => { console.log('[buybot] Shutting down'); process.exit(0); });
 
-main().catch(e => { console.error('[presale-bot] Fatal:', e.message); process.exit(1); });
+main().catch(e => { console.error('[buybot] Fatal:', e.message); process.exit(1); });

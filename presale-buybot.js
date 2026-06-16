@@ -215,10 +215,19 @@ function buildMessage({ buyer, ethSpent, tokensBought, priceUsd, txHash }) {
   const buttons = [
     [
       { text: '🔍 View TX', url: `https://etherscan.io/tx/${txHash}` },
-      { text: '📈 Chart', url: `https://dexscreener.com/ethereum/${POOL_ID}` },
+    ],
+    // 🛒 Buy & Track BDSBC
+    [
+      { text: '🦎 GeckoTerminal', url: 'https://www.geckoterminal.com/eth/pools/0x40e344af275ae7a6fcf208d257146ba47942f31d3eac9927a83dfb5975487cc6' },
+      { text: '🐦 Birdeye', url: 'https://birdeye.so/ethereum/token/0x10b2b342111cf1f45f5C0Ab2f3C1055549FE0A22' },
     ],
     [
-      { text: '🛒 Buy', url: `https://app.uniswap.org/swap?chain=ethereum&outputCurrency=${TOKEN_ADDRESS}` },
+      { text: '📊 DEXTools', url: 'https://www.dextools.io/app/ether/pair-explorer/0x40e344af275ae7a6fcf208d257146ba47942f31d3eac9927a83dfb5975487cc6' },
+      { text: '📈 DEXScreener', url: 'https://dexscreener.com/ethereum/0x40e344af275ae7a6fcf208d257146ba47942f31d3eac9927a83dfb5975487cc6' },
+    ],
+    [
+      { text: '⚡️ GMGN', url: 'https://gmgn.ai/eth/token/0x10b2b342111cf1f45f5c0ab2f3c1055549fe0a22' },
+      { text: '🦄 Buy on Uniswap', url: 'https://app.uniswap.org/swap?chain=ethereum&outputCurrency=0x10b2b342111cf1f45f5C0Ab2f3C1055549FE0A22' },
     ],
     [
       { text: '🤖 Android APP', url: 'https://play.google.com/store/apps/details?id=com.kirogames.bugsdestroyerinsectsmash' },
